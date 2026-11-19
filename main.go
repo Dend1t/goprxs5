@@ -1,12 +1,16 @@
 package main
 
 import (
+	"bufio"
+	"encoding/base64"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -38,14 +42,14 @@ func main() {
 	}
 	defer ln.Close()
 
-	log.Printf("SOCKS5 listening on :%s", port)
+	log.Printf("Proxy (SOCKS5 + HTTP) listening on :%s", port)
 
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			continue
 		}
-		go handleClient(conn, user, pass)
+		go handleConn(conn, user, pass)
 	}
 }
 
@@ -57,23 +61,36 @@ func tuneTCP(c net.Conn) {
 	}
 }
 
-func handleClient(conn net.Conn, user, pass string) {
+func handleConn(conn net.Conn, user, pass string) {
 	defer conn.Close()
 	tuneTCP(conn)
-
 	_ = conn.SetDeadline(time.Now().Add(20 * time.Second))
 
+	br := bufio.NewReader(conn)
+	peek, err := br.Peek(1)
+	if err != nil || len(peek) == 0 {
+		return
+	}
+
+	if peek[0] == socksVersion5 {
+		handleSOCKS5(conn, br, user, pass)
+		return
+	}
+
+	handleHTTP(conn, br, user, pass)
+}
+
+func handleSOCKS5(conn net.Conn, br *bufio.Reader, user, pass string) {
 	hdr := make([]byte, 2)
-	if _, err := io.ReadFull(conn, hdr); err != nil {
+	if _, err := io.ReadFull(br, hdr); err != nil {
 		return
 	}
 	if hdr[0] != socksVersion5 {
 		return
 	}
 
-	nMethods := int(hdr[1])
-	methods := make([]byte, nMethods)
-	if _, err := io.ReadFull(conn, methods); err != nil {
+	methods := make([]byte, int(hdr[1]))
+	if _, err := io.ReadFull(br, methods); err != nil {
 		return
 	}
 
@@ -94,23 +111,21 @@ func handleClient(conn net.Conn, user, pass string) {
 	}
 
 	authHdr := make([]byte, 2)
-	if _, err := io.ReadFull(conn, authHdr); err != nil || authHdr[0] != 0x01 {
+	if _, err := io.ReadFull(br, authHdr); err != nil || authHdr[0] != 0x01 {
 		return
 	}
 
-	uLen := int(authHdr[1])
-	uBuf := make([]byte, uLen)
-	if _, err := io.ReadFull(conn, uBuf); err != nil {
+	uBuf := make([]byte, int(authHdr[1]))
+	if _, err := io.ReadFull(br, uBuf); err != nil {
 		return
 	}
 
 	pLenBuf := make([]byte, 1)
-	if _, err := io.ReadFull(conn, pLenBuf); err != nil {
+	if _, err := io.ReadFull(br, pLenBuf); err != nil {
 		return
 	}
-	pLen := int(pLenBuf[0])
-	pBuf := make([]byte, pLen)
-	if _, err := io.ReadFull(conn, pBuf); err != nil {
+	pBuf := make([]byte, int(pLenBuf[0]))
+	if _, err := io.ReadFull(br, pBuf); err != nil {
 		return
 	}
 
@@ -123,11 +138,11 @@ func handleClient(conn net.Conn, user, pass string) {
 	}
 
 	reqHdr := make([]byte, 4)
-	if _, err := io.ReadFull(conn, reqHdr); err != nil {
+	if _, err := io.ReadFull(br, reqHdr); err != nil {
 		return
 	}
 	if reqHdr[0] != socksVersion5 || reqHdr[1] != cmdConnect {
-		_ = sendReply(conn, 0x07)
+		_ = sendSOCKSReply(conn, 0x07)
 		return
 	}
 
@@ -135,75 +150,163 @@ func handleClient(conn net.Conn, user, pass string) {
 	switch reqHdr[3] {
 	case addrIPv4:
 		ip := make([]byte, 4)
-		if _, err := io.ReadFull(conn, ip); err != nil {
+		if _, err := io.ReadFull(br, ip); err != nil {
 			return
 		}
 		host = net.IP(ip).String()
 	case addrDomain:
 		dLenBuf := make([]byte, 1)
-		if _, err := io.ReadFull(conn, dLenBuf); err != nil {
+		if _, err := io.ReadFull(br, dLenBuf); err != nil {
 			return
 		}
 		dBuf := make([]byte, int(dLenBuf[0]))
-		if _, err := io.ReadFull(conn, dBuf); err != nil {
+		if _, err := io.ReadFull(br, dBuf); err != nil {
 			return
 		}
 		host = string(dBuf)
 	case addrIPv6:
 		ip := make([]byte, 16)
-		if _, err := io.ReadFull(conn, ip); err != nil {
+		if _, err := io.ReadFull(br, ip); err != nil {
 			return
 		}
 		host = net.IP(ip).String()
 	default:
-		_ = sendReply(conn, 0x08)
+		_ = sendSOCKSReply(conn, 0x08)
 		return
 	}
 
 	portBuf := make([]byte, 2)
-	if _, err := io.ReadFull(conn, portBuf); err != nil {
+	if _, err := io.ReadFull(br, portBuf); err != nil {
 		return
 	}
 	targetPort := binary.BigEndian.Uint16(portBuf)
 	targetAddr := net.JoinHostPort(host, fmt.Sprintf("%d", targetPort))
 
-	// Снимаем дедлайн рукопожатия и даём отдельный таймаут только на подключение к цели
 	_ = conn.SetDeadline(time.Time{})
 
-	dialer := net.Dialer{
+	remote, err := (&net.Dialer{
 		Timeout:   10 * time.Second,
 		KeepAlive: 30 * time.Second,
-	}
-	remote, err := dialer.Dial("tcp", targetAddr)
+	}).Dial("tcp", targetAddr)
 	if err != nil {
-		_ = sendReply(conn, 0x05)
+		_ = sendSOCKSReply(conn, 0x05)
 		return
 	}
 	defer remote.Close()
 	tuneTCP(remote)
 
-	if err := sendReply(conn, 0x00); err != nil {
+	if err := sendSOCKSReply(conn, 0x00); err != nil {
 		return
 	}
 
+	relayBuffered(conn, br, remote)
+}
+
+func handleHTTP(conn net.Conn, br *bufio.Reader, user, pass string) {
+	req, err := http.ReadRequest(br)
+	if err != nil {
+		return
+	}
+	defer req.Body.Close()
+
+	if !checkBasicAuth(req.Header.Get("Proxy-Authorization"), user, pass) {
+		_, _ = io.WriteString(conn, "HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"proxy\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+		return
+	}
+
+	_ = conn.SetDeadline(time.Time{})
+
+	if strings.EqualFold(req.Method, http.MethodConnect) {
+		targetAddr := req.Host
+		if !strings.Contains(targetAddr, ":") {
+			targetAddr = net.JoinHostPort(targetAddr, "443")
+		}
+
+		remote, err := (&net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).Dial("tcp", targetAddr)
+		if err != nil {
+			_, _ = io.WriteString(conn, "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+			return
+		}
+		defer remote.Close()
+		tuneTCP(remote)
+
+		if _, err := io.WriteString(conn, "HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
+			return
+		}
+
+		relayBuffered(conn, br, remote)
+		return
+	}
+
+	targetAddr := req.Host
+	if !strings.Contains(targetAddr, ":") {
+		targetAddr = net.JoinHostPort(targetAddr, "80")
+	}
+
+	remote, err := (&net.Dialer{
+		Timeout:   10 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}).Dial("tcp", targetAddr)
+	if err != nil {
+		_, _ = io.WriteString(conn, "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+		return
+	}
+	defer remote.Close()
+	tuneTCP(remote)
+
+	req.Header.Del("Proxy-Authorization")
+	req.Header.Del("Proxy-Connection")
+	if req.URL != nil && req.URL.Path == "" {
+		req.URL.Path = "/"
+	}
+
+	if err := req.Write(remote); err != nil {
+		return
+	}
+	_, _ = io.Copy(conn, remote)
+}
+
+func checkBasicAuth(headerVal, user, pass string) bool {
+	if !strings.HasPrefix(headerVal, "Basic ") {
+		return false
+	}
+	raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(strings.TrimPrefix(headerVal, "Basic ")))
+	if err != nil {
+		return false
+	}
+	parts := strings.SplitN(string(raw), ":", 2)
+	return len(parts) == 2 && parts[0] == user && parts[1] == pass
+}
+
+func relayBuffered(clientConn net.Conn, clientReader *bufio.Reader, remoteConn net.Conn) {
 	done := make(chan struct{}, 2)
-	go relayHalf(remote, conn, done)
-	go relayHalf(conn, remote, done)
+
+	go func() {
+		if clientReader.Buffered() > 0 {
+			_, _ = io.CopyN(remoteConn, clientReader, int64(clientReader.Buffered()))
+		}
+		_, _ = io.Copy(remoteConn, clientConn)
+		if tcpRemote, ok := remoteConn.(*net.TCPConn); ok {
+			_ = tcpRemote.CloseWrite()
+		}
+		done <- struct{}{}
+	}()
+
+	go func() {
+		_, _ = io.Copy(clientConn, remoteConn)
+		if tcpClient, ok := clientConn.(*net.TCPConn); ok {
+			_ = tcpClient.CloseWrite()
+		}
+		done <- struct{}{}
+	}()
+
 	<-done
 }
 
-func relayHalf(dst, src net.Conn, done chan<- struct{}) {
-	_, _ = io.Copy(dst, src)
-	if tcpDst, ok := dst.(*net.TCPConn); ok {
-		_ = tcpDst.CloseWrite()
-	}
-	if tcpSrc, ok := src.(*net.TCPConn); ok {
-		_ = tcpSrc.CloseRead()
-	}
-	done <- struct{}{}
-}
-
-func sendReply(conn net.Conn, rep byte) error {
+func sendSOCKSReply(conn net.Conn, rep byte) error {
 	_, err := conn.Write([]byte{
 		socksVersion5,
 		rep,
