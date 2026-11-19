@@ -28,7 +28,7 @@ func getEnv(key, fallback string) string {
 }
 
 func main() {
-	port := getEnv("PORT", "1080")
+	port := getEnv("PORT", "8080")
 	user := getEnv("PROXY_USER", "user")
 	pass := getEnv("PROXY_PASS", "pass")
 
@@ -49,9 +49,19 @@ func main() {
 	}
 }
 
+func tuneTCP(c net.Conn) {
+	if tcpConn, ok := c.(*net.TCPConn); ok {
+		_ = tcpConn.SetNoDelay(true)
+		_ = tcpConn.SetKeepAlive(true)
+		_ = tcpConn.SetKeepAlivePeriod(30 * time.Second)
+	}
+}
+
 func handleClient(conn net.Conn, user, pass string) {
 	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(60 * time.Second))
+	tuneTCP(conn)
+
+	_ = conn.SetDeadline(time.Now().Add(20 * time.Second))
 
 	hdr := make([]byte, 2)
 	if _, err := io.ReadFull(conn, hdr); err != nil {
@@ -157,29 +167,40 @@ func handleClient(conn net.Conn, user, pass string) {
 	targetPort := binary.BigEndian.Uint16(portBuf)
 	targetAddr := net.JoinHostPort(host, fmt.Sprintf("%d", targetPort))
 
-	remote, err := net.DialTimeout("tcp", targetAddr, 10*time.Second)
+	// Снимаем дедлайн рукопожатия и даём отдельный таймаут только на подключение к цели
+	_ = conn.SetDeadline(time.Time{})
+
+	dialer := net.Dialer{
+		Timeout:   10 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
+	remote, err := dialer.Dial("tcp", targetAddr)
 	if err != nil {
 		_ = sendReply(conn, 0x05)
 		return
 	}
 	defer remote.Close()
+	tuneTCP(remote)
 
 	if err := sendReply(conn, 0x00); err != nil {
 		return
 	}
 
-	_ = conn.SetDeadline(time.Time{})
-
 	done := make(chan struct{}, 2)
-	go func() {
-		_, _ = io.Copy(remote, conn)
-		done <- struct{}{}
-	}()
-	go func() {
-		_, _ = io.Copy(conn, remote)
-		done <- struct{}{}
-	}()
+	go relayHalf(remote, conn, done)
+	go relayHalf(conn, remote, done)
 	<-done
+}
+
+func relayHalf(dst, src net.Conn, done chan<- struct{}) {
+	_, _ = io.Copy(dst, src)
+	if tcpDst, ok := dst.(*net.TCPConn); ok {
+		_ = tcpDst.CloseWrite()
+	}
+	if tcpSrc, ok := src.(*net.TCPConn); ok {
+		_ = tcpSrc.CloseRead()
+	}
+	done <- struct{}{}
 }
 
 func sendReply(conn net.Conn, rep byte) error {
